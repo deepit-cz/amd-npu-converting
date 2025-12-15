@@ -9,7 +9,58 @@ import os
 
 # Path to your local model folder
 # Change this to match where you saved the model
-MODEL_PATH = "./models/Qwen3-Coder-30B-A3B-Instruct-int4-AutoRound"
+# Use the non-FP8 variant for CPU export to avoid XPU-only FP8 kernels
+MODEL_PATH = "./models/Qwen3-Coder-30B-A3B-Instruct"
+
+# Toggle ONNX export (set to False to skip export step)
+EXPORT_TO_ONNX = True
+# Force CPU execution (overrides GPU/XPU detection)
+FORCE_CPU = True
+
+# Some Arc GPUs (e.g., B580) do not support xpu mem_get_info yet; patch to avoid crashes
+def _patch_xpu_mem_get_info():
+    if getattr(_patch_xpu_mem_get_info, "_patched", False):
+        return
+    fallback_total = 8 * 1024 ** 3  # assume 8GB total as safe default
+    fallback_free = int(fallback_total * 0.9)
+
+    try:
+        import torch.xpu.memory as xpu_mem
+        orig_fn = getattr(xpu_mem, "mem_get_info", None)
+
+        def safe_mem_get_info(device=None):
+            try:
+                if orig_fn:
+                    return orig_fn(device)
+            except Exception:
+                pass
+            print("Note: xpu mem_get_info unsupported; using fallback free/total values.")
+            return (fallback_free, fallback_total)
+
+        if orig_fn:
+            xpu_mem.mem_get_info = safe_mem_get_info
+    except Exception as e:
+        print(f"Note: could not patch torch.xpu.memory.mem_get_info: {e}")
+
+    try:
+        import torch._C as _C
+        orig_c_fn = getattr(_C, "_xpu_getMemoryInfo", None)
+
+        def safe_c_mem_info(device=None):
+            try:
+                if orig_c_fn:
+                    return orig_c_fn(device)
+            except Exception:
+                pass
+            print("Note: xpu _xpu_getMemoryInfo unsupported; using fallback free/total values.")
+            return (fallback_free, fallback_total)
+
+        if orig_c_fn:
+            _C._xpu_getMemoryInfo = safe_c_mem_info
+    except Exception as e:
+        print(f"Note: could not patch torch._C._xpu_getMemoryInfo: {e}")
+
+    _patch_xpu_mem_get_info._patched = True
 
 # Check if model exists
 if not os.path.exists(MODEL_PATH):
@@ -23,20 +74,30 @@ if not os.path.exists(MODEL_PATH):
 print(f"Loading model from: {os.path.abspath(MODEL_PATH)}\n")
 
 # Load from local folder
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+# fix_mistral_regex handles known tokenizer regex bug for some Mistral-based releases
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_PATH,
+    trust_remote_code=True,
+    fix_mistral_regex=True
+)
 
 # Check for available accelerators (CUDA, Intel XPU, or CPU)
-has_cuda = torch.cuda.is_available()
+has_cuda = False if FORCE_CPU else torch.cuda.is_available()
 has_intel_gpu = False
 intel_gpu_device = None
 
 # Check for Intel GPU (XPU) - requires intel-extension-for-pytorch
 try:
     import intel_extension_for_pytorch as ipex
-    if hasattr(ipex, 'xpu') and ipex.xpu.is_available():
+    ipex_available = hasattr(ipex, "xpu")
+    ipex_xpu_ok = False
+    if ipex_available and hasattr(ipex.xpu, "is_available"):
+        ipex_xpu_ok = ipex.xpu.is_available()
+    torch_xpu_ok = hasattr(torch, "xpu") and torch.xpu.is_available()
+    if not FORCE_CPU and (ipex_xpu_ok or torch_xpu_ok):
         has_intel_gpu = True
         intel_gpu_device = torch.device("xpu:0")
-        print(f"✓ Intel GPU (XPU) detected!")
+        print(f"✓ Intel GPU (XPU) detected! (torch.xpu={torch_xpu_ok}, ipex.xpu={ipex_xpu_ok})")
         print(f"  Using Intel GPU for faster conversion (4-12 hours vs 12-48+ hours on CPU)")
 except ImportError:
     print("ℹ Intel Extension for PyTorch not installed.")
@@ -59,6 +120,15 @@ if has_cuda:
         model = model.to(torch.bfloat16)
 elif has_intel_gpu:
     print("Loading model on Intel GPU (XPU)...")
+    # Ensure XPU device is the default for subsequent allocations/exports
+    try:
+        if hasattr(torch, "xpu"):
+            torch.xpu.set_device(0)
+        if hasattr(torch, "set_default_device"):
+            torch.set_default_device("xpu")
+        _patch_xpu_mem_get_info()
+    except Exception as e:
+        print(f"Note: Could not set default XPU device: {e}")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         device_map={"": "xpu:0"},  # Use Intel GPU
@@ -74,8 +144,7 @@ elif has_intel_gpu:
             print(f"Note: Could not convert to bfloat16: {e}")
             print("Using model's default dtype")
 else:
-    print("No GPU detected, loading on CPU...")
-    print("⚠ For faster conversion, consider using Intel GPU (install intel-extension-for-pytorch)")
+    print("Forcing CPU execution (FORCE_CPU=True).")
     # For CPU, use explicit CPU device_map to avoid disk offloading
     # MoE models may not support dtype parameter, so we load first then convert
     model = AutoModelForCausalLM.from_pretrained(
@@ -87,6 +156,8 @@ else:
     # Convert to bfloat16 after loading if needed
     if hasattr(model, 'to'):
         try:
+            if hasattr(torch, "set_default_device"):
+                torch.set_default_device("cpu")
             model = model.to(torch.bfloat16)
         except Exception as e:
             print(f"Note: Could not convert to bfloat16: {e}")
@@ -104,8 +175,22 @@ print(f"Model dtype: {next(model.parameters()).dtype}\n")
 # 
 # Uncomment the following code to convert the model to ONNX:
 #
-import onnx
-from optimum.onnxruntime import ORTModelForCausalLM
+if not EXPORT_TO_ONNX:
+    print("EXPORT_TO_ONNX=False -> skipping ONNX export step.")
+    exit(0)
+
+try:
+    import onnx
+except ImportError:
+    print("Missing dependency: onnx. Install with `pip install onnx`.")
+    exit(1)
+
+try:
+    from optimum.onnxruntime import ORTModelForCausalLM
+except ImportError:
+    print("Missing dependency: optimum with onnxruntime backend.")
+    print('Install with: pip install "optimum[onnxruntime]" onnxruntime')
+    exit(1)
 
 # Output path for ONNX model
 onnx_model_path = "./models/qwen3-coder-30b-onnx"
@@ -143,6 +228,31 @@ print("=" * 70 + "\n")
 # Use Optimum's ONNX exporter which handles transformers models better
 # This avoids the dynamic shape issues with torch.onnx.export
 try:
+    is_fp8 = "fp8" in MODEL_PATH.lower()
+    if is_fp8 and not (has_intel_gpu or has_cuda) and not FORCE_CPU:
+        print("This FP8 model expects a GPU (Intel XPU or NVIDIA) for export.")
+        print("No GPU detected, so ONNX export will fail. Options:")
+        print("  - Switch MODEL_PATH to a non-FP8 variant (e.g., standard bf16/fp16)")
+        print("  - Use an Intel Arc/NVIDIA GPU for export")
+        exit(1)
+
+    export_device = None
+    if FORCE_CPU:
+        export_device = "cpu"
+        if hasattr(torch, "set_default_device"):
+            torch.set_default_device("cpu")
+    elif has_intel_gpu:
+        export_device = "xpu"
+        try:
+            if hasattr(torch, "xpu"):
+                torch.xpu.set_device(0)
+            if hasattr(torch, "set_default_device"):
+                torch.set_default_device("xpu")
+        except Exception as e:
+            print(f"Note: Could not set XPU as default export device: {e}")
+    elif has_cuda:
+        export_device = "cuda"
+
     import time
     start_time = time.time()
     
@@ -157,13 +267,32 @@ try:
         "opset": 17,  # ONNX opset version 17 for Ryzen AI compatibility
         # Try to use consistent precision (float16) to avoid type mismatches
     }
+    if export_device in ("xpu", "cuda", "cpu"):
+        export_kwargs["device"] = export_device
     
-    ort_model = ORTModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        export=True,  # This triggers the export
-        export_kwargs=export_kwargs,
-        trust_remote_code=True
-    )
+    # Explicitly wrap export in a device context if available
+    if export_device == "xpu" and hasattr(torch, "xpu"):
+        ctx = torch.xpu.device(0)
+    elif export_device == "cuda" and torch.cuda.is_available():
+        ctx = torch.cuda.device(0)
+    elif export_device == "cpu":
+        class _CpuCtx:
+            def __enter__(self): return None
+            def __exit__(self, exc_type, exc, tb): return False
+        ctx = _CpuCtx()
+    else:
+        class _NullCtx:
+            def __enter__(self): return None
+            def __exit__(self, exc_type, exc, tb): return False
+        ctx = _NullCtx()
+
+    with ctx:
+        ort_model = ORTModelForCausalLM.from_pretrained(
+            MODEL_PATH,
+            export=True,  # This triggers the export
+            export_kwargs=export_kwargs,
+            trust_remote_code=True
+        )
     
     elapsed_time = time.time() - start_time
     hours = int(elapsed_time // 3600)

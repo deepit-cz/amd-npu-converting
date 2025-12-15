@@ -1,0 +1,13 @@
+torch>=2.2
+transformers
+accelerate
+optimum
+onnx
+onnxruntime
+# if using some model from auto-round, install this
+#auto-round>=0.5
+# GPU/NPU optional extras (install only if supported on your system):
+# onnxruntime-gpu
+# onnxruntime-genai
+# intel-extension-for-pytorch
+

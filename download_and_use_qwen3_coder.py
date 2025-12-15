@@ -12,7 +12,7 @@ import os
 # Windows: C:\Users\<username>\.cache\huggingface\hub\
 # Linux: ~/.cache/huggingface/hub/
 
-model_name = "Qwen/Qwen3-Coder-30B-A3B-Instruct"  # Full model name from Hugging Face
+model_name = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"  # Full model name from Hugging Face
 
 print(f"Loading model: {model_name}")
 print("Note: First run will download ~60GB of model files to Hugging Face cache.")

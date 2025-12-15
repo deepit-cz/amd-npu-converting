@@ -9,8 +9,8 @@ import os
 
 # Option 2: Download to a local folder
 # Set this to where you want the model stored
-MODEL_FOLDER = "./models/Qwen3-Coder-30B-A3B-Instruct"  # Local folder path
-model_name = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+MODEL_FOLDER = "./models/Qwen3-Coder-30B-A3B-Instruct-FP8"  # Local folder path
+model_name = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
 
 # Create directory if it doesn't exist
 os.makedirs(MODEL_FOLDER, exist_ok=True)
