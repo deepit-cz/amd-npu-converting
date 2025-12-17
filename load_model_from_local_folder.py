@@ -221,12 +221,42 @@ print("   - Intel GPU acceleration: Install 'intel-extension-for-pytorch'")
 print("   - Let it run overnight or over a weekend")
 print("   - Monitor memory usage (32GB may be tight)")
 print("   - The process will create checkpoint files you can resume")
+print("   - If you get 'No space left on device', check /tmp space (tmpfs may be full)")
+print("   - Temporary files will be stored in the output directory to avoid /tmp issues")
 if is_quantized:
     print("   - If you get precision errors, re-quantize the ONNX model using AMD Quark")
 print("=" * 70 + "\n")
 
 # Use Optimum's ONNX exporter which handles transformers models better
 # This avoids the dynamic shape issues with torch.onnx.export
+
+# Fix for "No space left on device" error - set TMPDIR to a location with more space
+# The /tmp directory (tmpfs) may be full, so use a location on the main filesystem
+import tempfile
+import shutil
+
+# Check /tmp space (if on Linux)
+try:
+    if os.path.exists('/tmp'):
+        stat = shutil.disk_usage('/tmp')
+        free_gb = stat.free / (1024**3)
+        if free_gb < 50:  # Less than 50GB free
+            print(f"⚠ Warning: /tmp has only {free_gb:.1f}GB free space")
+            print("   This may cause 'No space left on device' errors during export")
+except Exception:
+    pass  # Not on Linux or can't check
+
+# Use the output directory or a subdirectory for temporary files
+temp_dir = os.path.join(os.path.dirname(onnx_model_path), 'tmp_export')
+os.makedirs(temp_dir, exist_ok=True)
+os.environ['TMPDIR'] = temp_dir
+os.environ['TMP'] = temp_dir
+os.environ['TEMP'] = temp_dir
+tempfile.tempdir = temp_dir
+print(f"✓ Using temporary directory: {temp_dir}")
+print("  (This prevents 'No space left on device' errors when /tmp is full)")
+print("  Temporary files will be cleaned up after export completes\n")
+
 try:
     is_fp8 = "fp8" in MODEL_PATH.lower()
     if is_fp8 and not (has_intel_gpu or has_cuda) and not FORCE_CPU:
@@ -303,6 +333,17 @@ try:
     # Save the ONNX model
     ort_model.save_pretrained(onnx_model_path)
     print(f"\n✓ Model successfully exported to ONNX: {onnx_model_path}")
+    
+    # Clean up temporary files
+    try:
+        if os.path.exists(temp_dir):
+            temp_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))) / (1024**3)
+            print(f"\nCleaning up temporary files ({temp_size:.2f} GB)...")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            print("✓ Temporary files cleaned up")
+    except Exception as cleanup_error:
+        print(f"⚠ Could not clean up temporary directory {temp_dir}: {cleanup_error}")
+        print("  You can manually delete it later if needed")
     
     # Verify ONNX model
     try:

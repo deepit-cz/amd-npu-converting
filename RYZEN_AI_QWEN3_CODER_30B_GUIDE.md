@@ -167,6 +167,53 @@ AMD's Lemonade SDK provides easier deployment:
    - 30B model may be better suited for GPU/CPU hybrid execution
    - Monitor NPU utilization with Ryzen AI monitoring tools
 
+5. **"No space left on device" Error (Linux/Ubuntu):**
+   - This often occurs when `/tmp` (tmpfs) is full during ONNX export
+   - Check space: `df -h /tmp`
+   - **Solution 1 (Recommended):** The script automatically uses a custom TMPDIR to avoid this
+   - **Solution 2:** Temporarily increase `/tmp` size:
+     ```bash
+     sudo mount -o remount,size=500G /tmp
+     ```
+   - **Solution 3:** Permanently increase `/tmp` size by editing `/etc/fstab`:
+     ```bash
+     # Add or modify this line (requires root):
+     tmpfs /tmp tmpfs defaults,size=500G 0 0
+     # Then remount:
+     sudo mount -o remount /tmp
+     ```
+   - **Solution 4:** Use the script's automatic TMPDIR redirection (already implemented)
+
+6. **Process Killed / "Killed" Message (Linux/Ubuntu):**
+   - This usually means the process was killed by the OOM (Out of Memory) killer
+   - Check system logs: `dmesg | grep -i "out of memory"` or `journalctl -k | grep -i oom`
+   - **Solutions:**
+     - **Increase swap space:**
+       ```bash
+       # Create 64GB swap file
+       sudo fallocate -l 64G /swapfile
+       sudo chmod 600 /swapfile
+       sudo mkswap /swapfile
+       sudo swapon /swapfile
+       # Make permanent: Add to /etc/fstab
+       echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+       ```
+     - **Close other memory-intensive applications**
+     - **Run with nohup to survive terminal disconnection:**
+       ```bash
+       nohup python load_model_from_local_folder_ubuntu.py > export.log 2>&1 &
+       ```
+     - **Use systemd-run with memory protection:**
+       ```bash
+       systemd-run --scope -p MemoryLimit=64G python load_model_from_local_folder_ubuntu.py
+       ```
+     - **Adjust OOM score (requires root):**
+       ```bash
+       # After starting the process
+       echo -500 | sudo tee /proc/$(pgrep -f load_model_from_local_folder)/oom_score_adj
+       ```
+   - The script now includes automatic OOM protection and memory monitoring
+
 ## Alternative: Use Validated Smaller Models
 
 If NPU performance is critical, consider using validated Qwen models:

@@ -1,3 +1,4 @@
+# !!! POC, WIP !!! 
 # AMD Ryzen AI Qwen3-Coder-30B Manual
 
 ## Quick setup (start here)
